@@ -1,0 +1,10 @@
+node_modules/
+.DS_Store
+data/
+*.log
+apps/web/dist/
+config/loopy.local.json
+*.db
+*.sqlite
+.env*
+!.env.example

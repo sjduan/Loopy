@@ -1,0 +1,22 @@
+{
+  "name": "loopy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c cyan,magenta \"npm run dev -w @loopy/server\" \"npm run dev -w @loopy/web\"",
+    "build": "npm run build -w @loopy/shared && npm run build -w @loopy/server && npm run build -w @loopy/web",
+    "test": "vitest run",
+    "typecheck": "npm run typecheck -w @loopy/shared && npm run typecheck -w @loopy/server && npm run typecheck -w @loopy/web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

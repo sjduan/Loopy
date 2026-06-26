@@ -1,0 +1,11 @@
+{
+  "defaults": {
+    "workspace": "",
+    "remoteTarget": {
+      "label": "Remote machine",
+      "host": "user@example.com",
+      "sshKey": "~/.ssh/example",
+      "remoteCwd": "/home/user/git"
+    }
+  }
+}
