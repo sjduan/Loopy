@@ -59,6 +59,8 @@ export const api = {
   resume: (sessionId: string) => request<Session>(`/api/sessions/${sessionId}/resume`, { method: "POST" }),
   end: (sessionId: string) => request<Session>(`/api/sessions/${sessionId}/end`, { method: "POST" }),
   deleteSession: (sessionId: string) => request<{ ok: boolean }>(`/api/sessions/${sessionId}`, { method: "DELETE" }),
+  resetParticipantContext: (sessionId: string, participantId: string) =>
+    request<Session>(`/api/sessions/${sessionId}/participants/${participantId}/context/reset`, { method: "POST" }),
   invocation: (id: string) => request<Invocation>(`/api/invocations/${id}`),
   cancelInvocation: (id: string) => request<Invocation>(`/api/invocations/${id}/cancel`, { method: "POST" }),
   logs: (id: string) => request<InvocationLogs>(`/api/invocations/${id}/logs`)

@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isTuiAdapter, type AgentProfile, type InvocationStatus, type RemoteTarget, type Session } from "@loopy/shared";
+import { isTuiAdapter, type AgentProfile, type AgentRuntimeSession, type InvocationStatus, type RemoteTarget, type Session } from "@loopy/shared";
 import { renderCommand, type RemoteRenderExtras } from "./command.js";
 
 export type AgentInvocationInput = {
@@ -11,6 +11,7 @@ export type AgentInvocationInput = {
   session: Session;
   prompt: string;
   promptPath: string;
+  runtimeSession?: AgentRuntimeSession | null;
   signal?: AbortSignal;
   onOutput?: (chunk: string) => void;
 };
@@ -23,6 +24,7 @@ export type AgentInvocationResult = {
   startedAt: string;
   endedAt: string;
   commandSnapshot: string;
+  nativeSessionId?: string | null;
 };
 
 export async function invokeAgent(input: AgentInvocationInput): Promise<AgentInvocationResult> {
@@ -50,7 +52,8 @@ export async function invokeAgent(input: AgentInvocationInput): Promise<AgentInv
 
   // 本机 TUI 类 adapter（opencode / claude）走 PTY 包一层 + ANSI 剥离 + 实时流。
   if (isTuiAdapter(input.profile.adapterType)) {
-    return invokeWithScriptPty(input, rendered, startedAt);
+    const result = await invokeWithScriptPty(input, rendered, startedAt);
+    return withNativeSessionResult(input, result);
   }
 
   // shell_command fallback：普通 spawn。
@@ -255,6 +258,7 @@ function stripAnsi(value: string) {
 // nohup 让远端进程脱离 SSH 父进程，SSH 断线不影响它；重连后照常轮询。
 
 const REMOTE_POLL_INTERVAL_MS = 2000;
+const REMOTE_UPLOAD_MAX_ATTEMPTS = 3;
 
 function invokeRemote(
   input: AgentInvocationInput,
@@ -271,13 +275,13 @@ function invokeRemote(
     const extras: RemoteRenderExtras = { remotePromptFile };
     const remoteRendered = renderCommand(input, extras);
 
-    // 2. scp prompt 文件到远端。
-    const uploadOk = await scpUpload(remote, input.promptPath, remotePromptFile);
+    // 2. 通过 SSH stdin 写入 prompt 文件。相比 mkdir+scp 少一次连接，也更容易重试。
+    const uploadOk = await uploadRemotePromptWithRetry(remote, input.prompt, remotePromptFile);
     if (!uploadOk.ok) {
       return failedResult(rendered.snapshot, startedAt, `Failed to upload prompt to remote: ${uploadOk.stderr || uploadOk.stdout}`);
     }
 
-    // 3. 启动远端 headless 进程（setsid 进程组 + nohup，立即返回）。
+    // 3. 启动远端 headless 进程（setsid 进程组 + nohup，立即返回）。启动不重试，避免断线后重复启动。
     const launch = await launchRemoteJob(remote, runDir, remoteRendered.snapshot);
     if (!launch.ok) {
       return failedResult(rendered.snapshot, startedAt, `Failed to launch remote job: ${launch.stderr || launch.stdout}`);
@@ -352,7 +356,7 @@ function invokeRemote(
         ? "succeeded"
         : "failed";
 
-    return {
+    return withRemoteNativeSessionResult(input, {
       status,
       stdout: stripAnsi(logs.stdout),
       stderr: logs.stderr || lastErr,
@@ -360,8 +364,46 @@ function invokeRemote(
       startedAt,
       endedAt: new Date().toISOString(),
       commandSnapshot: rendered.snapshot
-    };
+    });
   })();
+}
+
+async function withNativeSessionResult(input: AgentInvocationInput, result: AgentInvocationResult): Promise<AgentInvocationResult> {
+  const runtime = input.runtimeSession;
+  if (!runtime || runtime.contextMode !== "native_cli") return result;
+  if (input.profile.adapterType === "claude_cli") {
+    return { ...result, nativeSessionId: runtime.nativeSessionId };
+  }
+  if (input.profile.adapterType !== "opencode_cli") return result;
+  if (runtime.nativeSessionId) return { ...result, nativeSessionId: runtime.nativeSessionId };
+  if (!runtime.nativeTitle) return result;
+  const list = await runSmallCommand(resolveCommand(input.profile.command || "opencode"), ["session", "list"]);
+  if (!list.ok) return result;
+  return { ...result, nativeSessionId: parseOpencodeSessionIdFromList(list.stdout, runtime.nativeTitle) };
+}
+
+async function withRemoteNativeSessionResult(input: AgentInvocationInput, result: AgentInvocationResult): Promise<AgentInvocationResult> {
+  const runtime = input.runtimeSession;
+  if (!runtime || runtime.contextMode !== "native_cli") return result;
+  if (input.profile.adapterType === "claude_cli") {
+    return { ...result, nativeSessionId: runtime.nativeSessionId };
+  }
+  if (input.profile.adapterType !== "opencode_cli") return result;
+  if (runtime.nativeSessionId) return { ...result, nativeSessionId: runtime.nativeSessionId };
+  if (!runtime.nativeTitle || !input.profile.remote) return result;
+  const cmd = input.profile.command || "opencode";
+  const list = await runRemoteBash(input.profile.remote, `${JSON.stringify(cmd)} session list`);
+  if (!list.ok) return result;
+  return { ...result, nativeSessionId: parseOpencodeSessionIdFromList(list.stdout, runtime.nativeTitle) };
+}
+
+export function parseOpencodeSessionIdFromList(output: string, title: string): string | null {
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("ses_") || !trimmed.includes(title)) continue;
+    return trimmed.split(/\s+/)[0] ?? null;
+  }
+  return null;
 }
 
 function failedResult(snapshot: string, startedAt: string, message: string): AgentInvocationResult {
@@ -382,7 +424,18 @@ function sleep(ms: number) {
 
 // ssh 基础参数。BatchMode=yes 避免卡在密码/passphrase 提示上。
 function sshArgs(remote: RemoteTarget, remoteCmd: string[]): string[] {
-  const args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
+  const args = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ConnectionAttempts=3",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3"
+  ];
   if (remote.sshKey) args.push("-i", expandTilde(remote.sshKey));
   args.push(remote.host);
   args.push(...remoteCmd);
@@ -404,12 +457,27 @@ function runRemoteBash(
     const child = spawn("ssh", sshArgs(remote, ["bash", "-s", "--", ...scriptArgs]), { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let stdinError = "";
+    let settled = false;
+    const finish = (result: { ok: boolean; code: number | null; stdout: string; stderr: string }) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     child.stdout.on("data", (c: Buffer) => (stdout += c.toString()));
     child.stderr.on("data", (c: Buffer) => (stderr += c.toString()));
-    child.on("error", (error) => resolve({ ok: false, code: null, stdout, stderr: stderr ? `${stripSshNoise(stderr)}\n${error.message}` : error.message }));
-    child.on("close", (code) => resolve({ ok: code === 0, code, stdout, stderr: stripSshNoise(stderr) }));
-    child.stdin.write(script);
-    child.stdin.end();
+    child.stdin.on("error", (error) => {
+      stdinError = error.message;
+    });
+    child.on("error", (error) => finish({ ok: false, code: null, stdout, stderr: [stripSshNoise(stderr), error.message].filter(Boolean).join("\n") }));
+    child.on("close", (code) => {
+      const cleanStderr = [stripSshNoise(stderr), stdinError ? `stdin write failed: ${stdinError}` : ""].filter(Boolean).join("\n");
+      finish({ ok: code === 0 && !stdinError, code, stdout, stderr: cleanStderr });
+    });
+    child.stdin.write(script, (error) => {
+      if (error) stdinError = error.message;
+      child.stdin.end();
+    });
   });
 }
 
@@ -430,25 +498,66 @@ function stripSshNoise(stderr: string): string {
     .join("\n");
 }
 
-async function scpUpload(remote: RemoteTarget, localPath: string, remotePath: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  // scp 不会自动建父目录，先 SSH 进去 mkdir -p。
-  const remoteDir = path.posix.dirname(remotePath);
-  const mkdir = await runRemoteBash(remote, `mkdir -p ${JSON.stringify(remoteDir)}`);
-  if (!mkdir.ok) {
-    return { ok: false, stdout: mkdir.stdout, stderr: `mkdir -p ${remoteDir} failed: ${stripSshNoise(mkdir.stderr) || mkdir.stdout}` };
+async function uploadRemotePromptWithRetry(
+  remote: RemoteTarget,
+  prompt: string,
+  remotePath: string
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const failures: string[] = [];
+  for (let attempt = 1; attempt <= REMOTE_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+    const result = await uploadRemotePrompt(remote, prompt, remotePath);
+    if (result.ok) {
+      return attempt === 1
+        ? result
+        : {
+            ...result,
+            stderr: `Prompt upload succeeded on attempt ${attempt} after ${attempt - 1} transient failure(s).`
+          };
+    }
+    failures.push(`attempt ${attempt}: ${result.stderr || result.stdout || "unknown upload failure"}`);
+    if (attempt < REMOTE_UPLOAD_MAX_ATTEMPTS) {
+      await sleep(500 * 2 ** (attempt - 1));
+    }
   }
-  return new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve) => {
-    const args = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"];
-    if (remote.sshKey) args.push("-i", expandTilde(remote.sshKey));
-    args.push(localPath, `${remote.host}:${remotePath}`);
-    const child = spawn("scp", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (c: Buffer) => (stdout += c.toString()));
-    child.stderr.on("data", (c: Buffer) => (stderr += c.toString()));
-    child.on("error", (error) => resolve({ ok: false, stdout, stderr: stderr ? `${stripSshNoise(stderr)}\n${error.message}` : error.message }));
-    child.on("close", (code) => resolve({ ok: code === 0, stdout, stderr: stripSshNoise(stderr) }));
-  });
+  return {
+    ok: false,
+    stdout: "",
+    stderr: `Prompt upload failed after ${REMOTE_UPLOAD_MAX_ATTEMPTS} attempts.\n${failures.join("\n")}`
+  };
+}
+
+async function uploadRemotePrompt(
+  remote: RemoteTarget,
+  prompt: string,
+  remotePath: string
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const remoteDir = path.posix.dirname(remotePath);
+  const promptB64 = Buffer.from(prompt, "utf8").toString("base64");
+  const script = `set -euo pipefail
+remote_dir=$1
+remote_path=$2
+mkdir -p "$remote_dir"
+tmp_b64="$remote_path.b64.$$"
+cat > "$tmp_b64" <<'LOOPYPROMPTB64'
+${promptB64}
+LOOPYPROMPTB64
+if base64 -d "$tmp_b64" > "$remote_path" 2>/dev/null; then
+  rm -f "$tmp_b64"
+elif base64 --decode "$tmp_b64" > "$remote_path" 2>/dev/null; then
+  rm -f "$tmp_b64"
+else
+  rm -f "$tmp_b64"
+  echo "Failed to decode prompt payload with base64." >&2
+  exit 1
+fi
+printf 'UPLOADED:%s\\n' "$remote_path"
+`;
+  const result = await runRemoteBash(remote, script, [remoteDir, remotePath]);
+  return {
+    ok: result.ok,
+    stdout: result.stdout,
+    stderr: result.ok ? stripSshNoise(result.stderr) : `ssh prompt upload failed: ${stripSshNoise(result.stderr) || result.stdout}`
+  };
 }
 
 // 启动远端 headless 作业：写命令文件 + runner，setsid 起进程组，立即返回。

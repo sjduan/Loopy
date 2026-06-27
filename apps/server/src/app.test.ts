@@ -237,6 +237,12 @@ describe("Loopy API", () => {
 	    expect(afterReviewer.invocations.length).toBe(2);
 	    expect(afterReviewer.invocations[1].participantId).toBe(reviewerParticipant.id);
 	    expect(afterReviewer.messages.some((message: any) => message.messageType === "agent_to_agent")).toBe(true);
+    expect(
+      afterReviewer.messages.some(
+        (message: any) =>
+          message.messageType === "agent_to_user" && message.relatedInvocationId === afterReviewer.invocations[1].id
+      )
+    ).toBe(false);
 
     const logsResponse = await app.inject({
       method: "GET",
@@ -244,6 +250,112 @@ describe("Loopy API", () => {
     });
     expect(logsResponse.statusCode).toBe(200);
     expect(logsResponse.json().prompt).toContain("Exercise API");
+    await app.close();
+  });
+
+  it("defaults sessions to unlimited rounds", async () => {
+    const app = makeTestApp();
+    const agent = await createShellAgent(app, "unlimited rounds", `process.stdout.write("ok");`);
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+      payload: {
+        name: "Unlimited",
+        goal: "No automatic round limit",
+        workspace: process.cwd(),
+        participantAgentProfileIds: [agent.id]
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().maxRounds).toBe(0);
+    await app.close();
+  });
+
+  it("creates, reuses, and resets native CLI runtime context for claude profiles", async () => {
+    const app = makeTestApp();
+    const profileResponse = await app.inject({
+      method: "POST",
+      url: "/api/agent-profiles",
+      payload: {
+        name: "fake claude",
+        adapterType: "claude_cli",
+        command: "/bin/echo",
+        args: ["ok"],
+        cwd: process.cwd(),
+        rolePrompt: "Fake claude.",
+        model: "sonnet",
+        timeoutMs: 5000
+      }
+    });
+    const profile = profileResponse.json();
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+      payload: {
+        name: "Native context",
+        goal: "Reuse context",
+        workspace: process.cwd(),
+        participantAgentProfileIds: [profile.id]
+      }
+    });
+    const session = created.json();
+    const participantId = session.participants[0].id;
+
+    await app.inject({
+      method: "POST",
+      url: `/api/sessions/${session.id}/invoke`,
+      payload: { toParticipantId: participantId, content: "first" }
+    });
+    const afterFirst = await waitForSession(app, session.id, (item) => item.invocations?.[0]?.status === "succeeded");
+    const firstNativeId = afterFirst.participants[0].runtimeSession.nativeSessionId;
+    expect(firstNativeId).toMatch(/[0-9a-f-]{36}/);
+    expect(afterFirst.participants[0].runtimeSession.status).toBe("active");
+    expect(afterFirst.invocations[0].nativeSessionId).toBe(firstNativeId);
+    expect(afterFirst.invocations[0].commandSnapshot).toContain("--session-id");
+
+    await app.inject({
+      method: "POST",
+      url: `/api/sessions/${session.id}/invoke`,
+      payload: { toParticipantId: participantId, content: "second" }
+    });
+    const afterSecond = await waitForSession(app, session.id, (item) => item.invocations?.length === 2 && item.invocations[1].status === "succeeded");
+    expect(afterSecond.participants[0].runtimeSession.nativeSessionId).toBe(firstNativeId);
+    expect(afterSecond.invocations[1].nativeSessionId).toBe(firstNativeId);
+    expect(afterSecond.invocations[1].commandSnapshot).toContain("--resume");
+    expect(afterSecond.invocations[1].commandSnapshot).not.toContain("--session-id");
+
+    const reset = await app.inject({
+      method: "POST",
+      url: `/api/sessions/${session.id}/participants/${participantId}/context/reset`
+    });
+    expect(reset.statusCode).toBe(200);
+    expect(reset.json().participants[0].runtimeSession.nativeSessionId).toBeNull();
+    expect(reset.json().participants[0].runtimeSession.status).toBe("reset");
+
+    await app.inject({
+      method: "POST",
+      url: `/api/sessions/${session.id}/invoke`,
+      payload: { toParticipantId: participantId, content: "third" }
+    });
+    const afterThird = await waitForSession(app, session.id, (item) => item.invocations?.length === 3 && item.invocations[2].status === "succeeded");
+    expect(afterThird.participants[0].runtimeSession.nativeSessionId).not.toBe(firstNativeId);
+    await app.close();
+  });
+
+  it("does not create native runtime context for shell profiles", async () => {
+    const app = makeTestApp();
+    const agent = await createShellAgent(app, "plain shell", `process.stdout.write("ok");`);
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/sessions",
+      payload: {
+        name: "Shell context",
+        goal: "No native context",
+        workspace: process.cwd(),
+        participantAgentProfileIds: [agent.id]
+      }
+    });
+    expect(created.json().participants[0].runtimeSession).toBeNull();
     await app.close();
   });
 

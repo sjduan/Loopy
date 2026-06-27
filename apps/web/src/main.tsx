@@ -42,6 +42,7 @@ import {
   type SessionParticipant
 } from "@loopy/shared";
 import { api } from "./api";
+import { AgentConnectionMap } from "./components/AgentConnectionMap";
 import "./styles.css";
 
 type View = "sessions" | "agents";
@@ -208,7 +209,7 @@ function App() {
                 <strong>{session.name}</strong>
                 <small>{session.recentMessage?.content?.slice(0, 54) || session.goal}</small>
               </span>
-              <Status status={session.status} />
+              <Status status={session.status} label={sessionStatusLabel(session.status)} />
             </button>
           ))}
         </section>
@@ -251,6 +252,7 @@ function App() {
             onResume={(sessionId) => runAction(() => api.resume(sessionId), sessionId)}
             onEnd={(sessionId) => runAction(() => api.end(sessionId), sessionId)}
             onDelete={(sessionId) => runAction(() => api.deleteSession(sessionId), "")}
+            onResetContext={(sessionId, participantId) => runAction(() => api.resetParticipantContext(sessionId, participantId), sessionId)}
             onSelectInvocation={setSelectedInvocationId}
           />
         ) : (
@@ -316,10 +318,14 @@ function SessionWorkspace(props: {
   onResume: (sessionId: string) => void;
   onEnd: (sessionId: string) => void;
   onDelete: (sessionId: string) => void;
+  onResetContext: (sessionId: string, participantId: string) => void;
   onSelectInvocation: (id: string) => void;
 }) {
 	  const [showCreate, setShowCreate] = useState(false);
   const relayActive = props.selectedSession ? isRelayAdvancing(props.selectedSession) : false;
+  const runningInvocation = props.selectedSession?.invocations?.find((invocation) => invocation.status === "running") ?? null;
+  const canMutateSession =
+    props.selectedSession && !["completed", "cancelled", "failed", "timeout"].includes(props.selectedSession.status);
 
   return (
     <div className="workspace-grid">
@@ -327,41 +333,45 @@ function SessionWorkspace(props: {
         <div className="toolbar">
           <div>
             <h3>Session Timeline</h3>
-            <p>{props.selectedSession ? `${props.selectedSession.roundCount}/${props.selectedSession.maxRounds} rounds` : "No session selected"}</p>
+            <p>{props.selectedSession ? roundLabel(props.selectedSession) : "No session selected"}</p>
           </div>
           <div className="toolbar-actions">
             {props.selectedSession && (
 	              <>
                 {props.selectedSession.routingMode === "auto_relay" && relayActive && (
-                  <button className="danger" onClick={() => props.onStopRelay(props.selectedSession!.id)}>
+                  <button className="danger" title="Stop automatic relay handoffs. Running agents keep their logs." onClick={() => props.onStopRelay(props.selectedSession!.id)}>
                     <StopCircle size={16} /> Stop Relay
                   </button>
                 )}
-	                {props.selectedSession.status === "running" ? (
-	                  <button className="danger" onClick={() => props.onCancel(props.selectedSession!.id)}>
-                    <StopCircle size={16} /> Stop Agent
-                  </button>
-                ) : props.selectedSession.status === "paused" ? (
-                  <button className="secondary" onClick={() => props.onResume(props.selectedSession!.id)}>
-                    <CirclePlay size={16} /> Resume
-                  </button>
-                ) : (
-                  <button className="secondary" onClick={() => props.onPause(props.selectedSession!.id)}>
-                    <Pause size={16} /> Pause
+                {runningInvocation && (
+	                  <button className="danger" title="Abort the currently running agent process." onClick={() => props.onCancel(props.selectedSession!.id)}>
+                    <StopCircle size={16} /> Stop Running Agent
                   </button>
                 )}
-                <button className="danger" onClick={() => props.onEnd(props.selectedSession!.id)}>
-                  <Square size={15} /> End
-                </button>
+                {props.selectedSession.status === "paused" ? (
+                  <button className="secondary" title="Resume this paused session." onClick={() => props.onResume(props.selectedSession!.id)}>
+                    <CirclePlay size={16} /> Resume Session
+                  </button>
+                ) : canMutateSession && !runningInvocation ? (
+                  <button className="secondary" title="Pause manual sends and automatic relay until resumed." onClick={() => props.onPause(props.selectedSession!.id)}>
+                    <Pause size={16} /> Pause Automation
+                  </button>
+                ) : null}
+                {canMutateSession && !runningInvocation && (
+                  <button className="danger" title="End this session and keep its timeline and logs." onClick={() => props.onEnd(props.selectedSession!.id)}>
+                    <Square size={15} /> End Session
+                  </button>
+                )}
                 <button
                   className="danger"
+                  title="Permanently delete this session record."
                   onClick={() => {
-                    if (window.confirm(`Delete session "${props.selectedSession!.name}" and its local logs?`)) {
+                    if (window.confirm(`Permanently delete session "${props.selectedSession!.name}"? Timeline records will be removed. Invocation artifact files may remain under data/.`)) {
                       props.onDelete(props.selectedSession!.id);
                     }
                   }}
                 >
-                  <Trash2 size={15} /> Delete
+                  <Trash2 size={15} /> Delete Session
                 </button>
               </>
             )}
@@ -384,7 +394,7 @@ function SessionWorkspace(props: {
 
 	        {props.selectedSession ? (
 	          <>
-	            <SessionHeader session={props.selectedSession} />
+	            <SessionHeader session={props.selectedSession} onResetContext={props.onResetContext} />
               <RelayPanel session={props.selectedSession} />
 	            <Timeline
               session={props.selectedSession}
@@ -402,6 +412,11 @@ function SessionWorkspace(props: {
       </section>
 
       <aside className="inspector">
+        <AgentConnectionMap
+          session={props.selectedSession}
+          selectedInvocationId={props.selectedInvocation?.id}
+          onSelectInvocation={props.onSelectInvocation}
+        />
         <InvocationPanel
           session={props.selectedSession}
           invocation={props.selectedInvocation}
@@ -432,6 +447,8 @@ function CreateSessionForm({
   const [workspace, setWorkspace] = useState(runtimeConfig.defaults.workspace);
   const [locality, setLocality] = useState<"local" | "remote">("local");
   const [routingMode, setRoutingMode] = useState<RoutingMode>("manual");
+  const [roundLimitEnabled, setRoundLimitEnabled] = useState(false);
+  const [maxRounds, setMaxRounds] = useState(6);
   const visibleProfiles = profiles.filter((profile) => (locality === "remote" ? profile.remote : !profile.remote));
   const [selected, setSelected] = useState<string[]>([]);
   const [edges, setEdges] = useState<string[]>([]);
@@ -486,6 +503,28 @@ function CreateSessionForm({
         Workspace
         <input value={workspace} onChange={(event) => setWorkspace(event.target.value)} />
       </label>
+      <label className="switch-row">
+        <input
+          type="checkbox"
+          checked={roundLimitEnabled}
+          onChange={(event) => setRoundLimitEnabled(event.target.checked)}
+        />
+        <span>
+          Limit relay rounds
+          <small>{roundLimitEnabled ? "Loopy stops automatically at this round count." : "Unlimited rounds. Stop relay manually when done."}</small>
+        </span>
+      </label>
+      {roundLimitEnabled && (
+        <label>
+          Max rounds
+          <input
+            type="number"
+            min={1}
+            value={maxRounds}
+            onChange={(event) => setMaxRounds(Math.max(1, Number(event.target.value) || 1))}
+          />
+        </label>
+      )}
       <div className="checkbox-grid">
         {visibleProfiles.map((profile) => (
           <label key={profile.id} className="check-row">
@@ -533,6 +572,7 @@ function CreateSessionForm({
             goal,
             workspace,
             participantAgentProfileIds: selected,
+            maxRounds: roundLimitEnabled ? Math.max(1, maxRounds) : 0,
             routingMode,
             edges: edges.map((key) => {
               const [fromAgentProfileId, toAgentProfileId] = key.split("::") as [string, string];
@@ -547,7 +587,13 @@ function CreateSessionForm({
   );
 }
 
-function SessionHeader({ session }: { session: Session }) {
+function SessionHeader({
+  session,
+  onResetContext
+}: {
+  session: Session;
+  onResetContext: (sessionId: string, participantId: string) => void;
+}) {
   return (
     <div className="session-header">
       <div>
@@ -556,9 +602,22 @@ function SessionHeader({ session }: { session: Session }) {
       </div>
       <div className="participant-row">
         {session.participants?.map((participant) => (
-          <span key={participant.id} className="participant">
-            <Bot size={15} /> {participant.displayName}
-          </span>
+          <div key={participant.id} className="participant context-participant">
+            <span className="participant-title"><Bot size={15} /> {participant.displayName}</span>
+            <small>{contextStatusLabel(participant)}</small>
+            {participant.runtimeSession?.contextMode === "native_cli" && (
+              <button
+                className="link-button"
+                onClick={() => {
+                  if (window.confirm(`Reset native CLI context for ${participant.displayName}? Next run will start a new CLI session.`)) {
+                    onResetContext(session.id, participant.id);
+                  }
+                }}
+              >
+                Reset context
+              </button>
+            )}
+          </div>
         ))}
       </div>
     </div>
@@ -596,22 +655,53 @@ function Timeline({ session, onSelectInvocation }: { session: Session; onSelectI
         <EmptyState icon={<Terminal size={34} />} title="No messages yet" body="Send a prompt to one of the participants." />
       )}
       {messages.map((message) => (
-        <article key={message.id} className={`message ${message.fromType}`}>
-          <div className="message-meta">
-            <span>{labelFor(session, message.fromId) || message.fromType}</span>
-            <ChevronRight size={14} />
-            <span>{labelFor(session, message.toId) || message.toType}</span>
-            <time>{new Date(message.createdAt).toLocaleTimeString()}</time>
-          </div>
-          <p>{message.content}</p>
-          {message.relatedInvocationId && (
-            <button className="link-button" onClick={() => onSelectInvocation(message.relatedInvocationId!)}>
-              <ExternalLink size={14} /> Open invocation
-            </button>
-          )}
-        </article>
+        <TimelineMessage key={message.id} session={session} message={message} onSelectInvocation={onSelectInvocation} />
       ))}
     </div>
+  );
+}
+
+function TimelineMessage({
+  session,
+  message,
+  onSelectInvocation
+}: {
+  session: Session;
+  message: NonNullable<Session["messages"]>[number];
+  onSelectInvocation: (id: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const preview = messagePreview(message.content);
+  const canExpand = preview !== message.content;
+
+  return (
+    <article className={`message ${message.fromType} ${expanded ? "expanded" : ""}`}>
+      <button className="message-toggle" onClick={() => setExpanded((value) => !value)} aria-expanded={expanded}>
+        <ChevronRight size={15} />
+        <span className="message-route">
+          <strong>{labelFor(session, message.fromId) || message.fromType}</strong>
+          <ChevronRight size={13} />
+          <strong>{labelFor(session, message.toId) || message.toType}</strong>
+        </span>
+        <span className="message-type">{message.messageType}</span>
+        <time>{new Date(message.createdAt).toLocaleTimeString()}</time>
+      </button>
+      <div className={expanded ? "message-body full" : "message-body"}>
+        {expanded ? message.content : preview}
+      </div>
+      <div className="message-actions">
+        {canExpand && (
+          <button className="link-button" onClick={() => setExpanded((value) => !value)}>
+            {expanded ? "Collapse" : "Expand"}
+          </button>
+        )}
+        {message.relatedInvocationId && (
+          <button className="link-button" onClick={() => onSelectInvocation(message.relatedInvocationId!)}>
+            <ExternalLink size={14} /> Open invocation
+          </button>
+        )}
+      </div>
+    </article>
   );
 }
 
@@ -711,6 +801,10 @@ function InvocationPanel({
         <strong>{invocation.exitCode ?? "-"}</strong>
         <span>Duration</span>
         <strong>{duration(invocation.startedAt, invocation.endedAt)}</strong>
+        <span>Native context</span>
+        <strong>{invocation.contextMode === "native_cli" ? invocation.nativeSessionId ?? "pending" : "none"}</strong>
+        <span>Native title</span>
+        <strong>{invocation.nativeTitle ?? "-"}</strong>
       </div>
       <code className="command-line">{invocation.commandSnapshot}</code>
       {session?.status === "running" && invocation.status === "running" && (
@@ -920,8 +1014,8 @@ function Metric({ label, value, icon, tone }: { label: string; value: number; ic
   return <div className={`metric ${tone}`}>{icon}<strong>{value}</strong><span>{label}</span></div>;
 }
 
-function Status({ status }: { status: string }) {
-  return <span className={`status ${status}`}>{status}</span>;
+function Status({ status, label }: { status: string; label?: string }) {
+  return <span className={`status ${status}`}>{label ?? status}</span>;
 }
 
 function LogBlock({ title, content }: { title: string; content?: string }) {
@@ -950,6 +1044,39 @@ function relayTargetsFor(session: Session, fromParticipantId: string | null) {
         (edge.toParticipantId === fromParticipantId && edge.fromParticipantId === participant.id)
     )
   );
+}
+
+function roundLabel(session: Session) {
+  return session.maxRounds > 0
+    ? `${session.roundCount}/${session.maxRounds} rounds`
+    : `${session.roundCount} rounds · unlimited`;
+}
+
+function sessionStatusLabel(status: Session["status"]) {
+  return status === "cancelled" ? "ended" : status;
+}
+
+function contextStatusLabel(participant: SessionParticipant) {
+  const runtime = participant.runtimeSession;
+  if (!runtime && participantSupportsNativeContext(participant)) return "new context next run";
+  if (!runtime || runtime.contextMode !== "native_cli") return "no native context";
+  if (runtime.nativeSessionId) return `native context active · ${runtime.nativeSessionId}`;
+  if (runtime.status === "missing") return "native context missing · will retry";
+  if (runtime.status === "reset") return "new context next run";
+  return "new context next run";
+}
+
+function participantSupportsNativeContext(participant: SessionParticipant) {
+  const adapterType = participant.agentProfile?.adapterType;
+  return adapterType === "opencode_cli" || adapterType === "claude_cli";
+}
+
+function messagePreview(content: string) {
+  const trimmed = content.trim();
+  const lines = trimmed.split(/\r?\n/);
+  const firstLines = lines.slice(0, 3).join("\n");
+  const clipped = firstLines.length > 240 ? `${firstLines.slice(0, 240).trimEnd()}...` : firstLines;
+  return lines.length > 3 || clipped.length < firstLines.length ? `${clipped}${clipped.endsWith("...") ? "" : "\n..."}` : clipped;
 }
 
 function pairs<T>(items: T[]): Array<[T, T]> {

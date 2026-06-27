@@ -88,6 +88,23 @@ export type AgentProfile = {
   updatedAt: string;
 };
 
+export type RuntimeContextMode = "native_cli" | "none";
+export type RuntimeSessionStatus = "pending" | "active" | "missing" | "reset";
+
+export type AgentRuntimeSession = {
+  id: string;
+  sessionId: string;
+  participantId: string;
+  adapterType: AdapterType;
+  nativeSessionId: string | null;
+  nativeTitle: string | null;
+  contextMode: RuntimeContextMode;
+  status: RuntimeSessionStatus;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+};
+
 export type SessionParticipant = {
   id: string;
   sessionId: string;
@@ -95,6 +112,7 @@ export type SessionParticipant = {
   displayName: string;
   role: string;
   agentProfile?: AgentProfile;
+  runtimeSession?: AgentRuntimeSession | null;
   createdAt: string;
 };
 
@@ -172,6 +190,9 @@ export type Invocation = {
   endedAt: string | null;
   summary: string;
   suggestedNextRecipientId: string | null;
+  nativeSessionId?: string | null;
+  nativeTitle?: string | null;
+  contextMode?: RuntimeContextMode;
   agentProfile?: AgentProfile;
 };
 

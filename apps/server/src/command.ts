@@ -1,10 +1,11 @@
-import { isTuiAdapter, type AgentProfile, type Session } from "@loopy/shared";
+import { isTuiAdapter, type AgentProfile, type AgentRuntimeSession, type Session } from "@loopy/shared";
 
 export type RenderCommandInput = {
   profile: AgentProfile;
   session: Session;
   prompt: string;
   promptPath: string;
+  runtimeSession?: AgentRuntimeSession | null;
 };
 
 export type RenderedCommand = {
@@ -55,7 +56,7 @@ export function renderCommand(input: RenderCommandInput, remoteExtras?: RemoteRe
       ? input.profile.args.map((arg) => replaceTokens(arg, input, remoteExtras))
       : defaultArgs(input, workspace, remoteExtras);
   if (isTuiAdapter(input.profile.adapterType)) {
-    args = withAdapterOptions(args, input.profile);
+    args = withAdapterOptions(args, input.profile, input.runtimeSession ?? null);
   }
   const command = replaceTokens(input.profile.command, input, remoteExtras);
   const cwd = replaceTokens(input.profile.cwd || workspace, input, remoteExtras);
@@ -67,31 +68,51 @@ export function renderCommand(input: RenderCommandInput, remoteExtras?: RemoteRe
   };
 }
 
-function withAdapterOptions(args: string[], profile: RenderCommandInput["profile"]) {
+function withAdapterOptions(args: string[], profile: RenderCommandInput["profile"], runtimeSession: AgentRuntimeSession | null) {
   if (profile.adapterType === "opencode_cli") {
-    return withOpencodeOptions(args, profile);
+    return withOpencodeOptions(args, profile, runtimeSession);
   }
   if (profile.adapterType === "claude_cli") {
-    return withClaudeOptions(args, profile);
+    return withClaudeOptions(args, profile, runtimeSession);
   }
   return args;
 }
 
-function withOpencodeOptions(args: string[], profile: RenderCommandInput["profile"]) {
+function withOpencodeOptions(args: string[], profile: RenderCommandInput["profile"], runtimeSession: AgentRuntimeSession | null) {
   const next = [...args];
   const insertAt = next[0] === "run" ? 1 : 0;
+  let cursor = insertAt;
   if (profile.opencodeAgent && !next.includes("--agent")) {
-    next.splice(insertAt, 0, "--agent", profile.opencodeAgent);
+    next.splice(cursor, 0, "--agent", profile.opencodeAgent);
+    cursor += 2;
+  }
+  if (runtimeSession?.contextMode === "native_cli") {
+    if (runtimeSession.nativeSessionId && !next.includes("--session")) {
+      next.splice(cursor, 0, "--session", runtimeSession.nativeSessionId);
+      cursor += 2;
+    } else if (!runtimeSession.nativeSessionId && runtimeSession.nativeTitle && !next.includes("--title")) {
+      next.splice(cursor, 0, "--title", runtimeSession.nativeTitle);
+      cursor += 2;
+    }
   }
   if (profile.skipPermissions && !next.includes("--dangerously-skip-permissions")) {
-    const insertPermissionAt = profile.opencodeAgent && !args.includes("--agent") ? insertAt + 2 : insertAt;
-    next.splice(insertPermissionAt, 0, "--dangerously-skip-permissions");
+    next.splice(cursor, 0, "--dangerously-skip-permissions");
   }
   return next;
 }
 
-function withClaudeOptions(args: string[], profile: RenderCommandInput["profile"]) {
+function withClaudeOptions(args: string[], profile: RenderCommandInput["profile"], runtimeSession: AgentRuntimeSession | null) {
   const next = [...args];
+  if (runtimeSession?.contextMode === "native_cli" && runtimeSession.nativeSessionId) {
+    const hasNativeContextArg = next.includes("--session-id") || next.includes("--resume") || next.includes("-r");
+    if (!hasNativeContextArg) {
+      if (runtimeSession.status === "active") {
+        next.push("--resume", runtimeSession.nativeSessionId);
+      } else {
+        next.push("--session-id", runtimeSession.nativeSessionId);
+      }
+    }
+  }
   if (profile.skipPermissions && !next.includes("--dangerously-skip-permissions")) {
     next.push("--dangerously-skip-permissions");
   }

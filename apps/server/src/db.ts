@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
 import {
   DEFAULT_INVOCATION_TIMEOUT_MS,
   DEFAULT_OPENCODE_MODEL,
   DEFAULT_CLAUDE_MODEL,
   type AgentProfile,
+  type AgentRuntimeSession,
   type AgentProfileInput,
   type CreateSessionEdgeInput,
   type Invocation,
@@ -17,6 +19,7 @@ import {
   type Session,
   type SessionEdge,
   type SessionParticipant,
+  type AdapterType,
   nowIso
 } from "@loopy/shared";
 import { makeId } from "./ids.js";
@@ -97,6 +100,21 @@ function migrate(db: Db) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS agent_runtime_sessions (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      participant_id TEXT NOT NULL REFERENCES session_participants(id) ON DELETE CASCADE,
+      adapter_type TEXT NOT NULL,
+      native_session_id TEXT,
+      native_title TEXT,
+      context_mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_used_at TEXT,
+      UNIQUE(session_id, participant_id)
+    );
+
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -123,9 +141,12 @@ function migrate(db: Db) {
       result_path TEXT NOT NULL,
       exit_code INTEGER,
       started_at TEXT NOT NULL,
-      ended_at TEXT,
+	      ended_at TEXT,
       summary TEXT NOT NULL,
-	      suggested_next_recipient_id TEXT
+	      suggested_next_recipient_id TEXT,
+      native_session_id TEXT,
+      native_title TEXT,
+      context_mode TEXT
 	    );
 
 	    CREATE TABLE IF NOT EXISTS app_meta (
@@ -141,6 +162,9 @@ function migrate(db: Db) {
 	  addColumnIfMissing(db, "sessions", "auto_state_json", "TEXT");
 	  addColumnIfMissing(db, "sessions", "edges_json", "TEXT");
 	  addColumnIfMissing(db, "sessions", "relay_state_json", "TEXT");
+  addColumnIfMissing(db, "invocations", "native_session_id", "TEXT");
+  addColumnIfMissing(db, "invocations", "native_title", "TEXT");
+  addColumnIfMissing(db, "invocations", "context_mode", "TEXT");
   db.prepare("UPDATE agent_profiles SET model = ? WHERE model = 'muprovider/GLM-5.2'").run(DEFAULT_OPENCODE_MODEL);
 }
 
@@ -381,7 +405,7 @@ export function createSession(db: Db, input: {
       input.goal,
       input.workspace,
       input.routingMode ?? "manual",
-      input.maxRounds ?? 6,
+      Math.max(0, Number(input.maxRounds ?? 0)),
       input.maxFailures ?? 2,
       now,
       now,
@@ -473,6 +497,7 @@ export function listParticipants(db: Db, sessionId: string): SessionParticipant[
     .map((row) => {
       const participant = mapParticipant(row);
       participant.agentProfile = getAgentProfile(db, participant.agentProfileId) ?? undefined;
+      participant.runtimeSession = getRuntimeSessionForParticipant(db, sessionId, participant.id);
       return participant;
     });
 }
@@ -482,7 +507,77 @@ export function getParticipant(db: Db, id: string): SessionParticipant | null {
   if (!row) return null;
   const participant = mapParticipant(row);
   participant.agentProfile = getAgentProfile(db, participant.agentProfileId) ?? undefined;
+  participant.runtimeSession = getRuntimeSessionForParticipant(db, participant.sessionId, participant.id);
   return participant;
+}
+
+export function getRuntimeSessionForParticipant(db: Db, sessionId: string, participantId: string): AgentRuntimeSession | null {
+  const row = db
+    .prepare("SELECT * FROM agent_runtime_sessions WHERE session_id = ? AND participant_id = ?")
+    .get(sessionId, participantId);
+  return row ? mapRuntimeSession(row) : null;
+}
+
+export function ensureRuntimeSession(
+  db: Db,
+  session: Session,
+  participant: SessionParticipant
+): AgentRuntimeSession | null {
+  const profile = participant.agentProfile ?? getAgentProfile(db, participant.agentProfileId);
+  if (!profile || !isNativeContextAdapter(profile.adapterType)) return null;
+  const existing = getRuntimeSessionForParticipant(db, session.id, participant.id);
+  if (existing) {
+    if ((profile.adapterType === "claude_cli" && !existing.nativeSessionId) || !existing.nativeTitle) {
+      const repaired = {
+        nativeSessionId: profile.adapterType === "claude_cli" ? cryptoRandomUuid() : existing.nativeSessionId,
+        nativeTitle: existing.nativeTitle ?? nativeTitle(session, participant),
+        status: "pending" as const
+      };
+      db.prepare(`
+        UPDATE agent_runtime_sessions
+        SET native_session_id = ?, native_title = ?, status = ?, updated_at = ?
+        WHERE id = ?
+      `).run(repaired.nativeSessionId, repaired.nativeTitle, repaired.status, nowIso(), existing.id);
+      return getRuntimeSessionForParticipant(db, session.id, participant.id);
+    }
+    return existing;
+  }
+
+  const now = nowIso();
+  const id = makeId("runtime");
+  const nativeSessionId = profile.adapterType === "claude_cli" ? cryptoRandomUuid() : null;
+  db.prepare(`
+    INSERT INTO agent_runtime_sessions
+    (id, session_id, participant_id, adapter_type, native_session_id, native_title, context_mode, status, created_at, updated_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'native_cli', 'pending', ?, ?, NULL)
+  `).run(id, session.id, participant.id, profile.adapterType, nativeSessionId, nativeTitle(session, participant), now, now);
+  return getRuntimeSessionForParticipant(db, session.id, participant.id);
+}
+
+export function markRuntimeSessionUsed(
+  db: Db,
+  runtimeSession: AgentRuntimeSession,
+  patch: { nativeSessionId?: string | null; status?: AgentRuntimeSession["status"] }
+) {
+  const nativeSessionId = patch.nativeSessionId !== undefined ? patch.nativeSessionId : runtimeSession.nativeSessionId;
+  const status = patch.status ?? (nativeSessionId ? "active" : runtimeSession.status);
+  db.prepare(`
+    UPDATE agent_runtime_sessions
+    SET native_session_id = ?, status = ?, last_used_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(nativeSessionId, status, nowIso(), nowIso(), runtimeSession.id);
+  return getRuntimeSessionForParticipant(db, runtimeSession.sessionId, runtimeSession.participantId);
+}
+
+export function resetRuntimeSessionForParticipant(db: Db, sessionId: string, participantId: string) {
+  const existing = getRuntimeSessionForParticipant(db, sessionId, participantId);
+  if (!existing) return null;
+  db.prepare(`
+    UPDATE agent_runtime_sessions
+    SET native_session_id = NULL, native_title = NULL, status = 'reset', last_used_at = NULL, updated_at = ?
+    WHERE id = ?
+  `).run(nowIso(), existing.id);
+  return getRuntimeSessionForParticipant(db, sessionId, participantId);
 }
 
 export function addMessage(db: Db, message: Omit<Message, "id" | "createdAt">) {
@@ -516,8 +611,8 @@ export function createInvocation(db: Db, input: Omit<Invocation, "agentProfile">
   db.prepare(`
     INSERT INTO invocations
     (id, session_id, agent_profile_id, participant_id, status, command_snapshot, prompt_path, stdout_path, stderr_path, result_path,
-      exit_code, started_at, ended_at, summary, suggested_next_recipient_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      exit_code, started_at, ended_at, summary, suggested_next_recipient_id, native_session_id, native_title, context_mode)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     input.id,
     input.sessionId,
@@ -533,7 +628,10 @@ export function createInvocation(db: Db, input: Omit<Invocation, "agentProfile">
     input.startedAt,
     input.endedAt,
     input.summary,
-    input.suggestedNextRecipientId
+    input.suggestedNextRecipientId,
+    input.nativeSessionId ?? null,
+    input.nativeTitle ?? null,
+    input.contextMode ?? null
   );
   return getInvocation(db, input.id)!;
 }
@@ -541,7 +639,7 @@ export function createInvocation(db: Db, input: Omit<Invocation, "agentProfile">
 export function updateInvocation(db: Db, invocation: Invocation) {
   db.prepare(`
     UPDATE invocations
-    SET participant_id = ?, status = ?, command_snapshot = ?, exit_code = ?, started_at = ?, ended_at = ?, summary = ?, suggested_next_recipient_id = ?
+    SET participant_id = ?, status = ?, command_snapshot = ?, exit_code = ?, started_at = ?, ended_at = ?, summary = ?, suggested_next_recipient_id = ?, native_session_id = ?, native_title = ?, context_mode = ?
     WHERE id = ?
   `).run(
     invocation.participantId,
@@ -552,6 +650,9 @@ export function updateInvocation(db: Db, invocation: Invocation) {
     invocation.endedAt,
     invocation.summary,
     invocation.suggestedNextRecipientId,
+    invocation.nativeSessionId ?? null,
+    invocation.nativeTitle ?? null,
+    invocation.contextMode ?? null,
     invocation.id
   );
   touchSession(db, invocation.sessionId);
@@ -611,7 +712,7 @@ export function recordInvocationOutcome(db: Db, sessionId: string, status: Invoc
   }
   if (status === "timeout") updateSessionStatus(db, sessionId, "timeout", "Invocation timed out.");
   else if (session.failureCount >= session.maxFailures) updateSessionStatus(db, sessionId, "failed", "Maximum failures reached.");
-  else if (session.roundCount >= session.maxRounds) updateSessionStatus(db, sessionId, "completed", "Maximum rounds reached.");
+  else if (session.maxRounds > 0 && session.roundCount >= session.maxRounds) updateSessionStatus(db, sessionId, "completed", "Maximum rounds reached.");
 }
 
 function touchSession(db: Db, id: string) {
@@ -694,6 +795,22 @@ function mapParticipant(row: any): SessionParticipant {
   };
 }
 
+function mapRuntimeSession(row: any): AgentRuntimeSession {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    participantId: row.participant_id,
+    adapterType: row.adapter_type,
+    nativeSessionId: row.native_session_id ?? null,
+    nativeTitle: row.native_title ?? null,
+    contextMode: row.context_mode === "native_cli" ? "native_cli" : "none",
+    status: ["pending", "active", "missing", "reset"].includes(row.status) ? row.status : "pending",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastUsedAt: row.last_used_at ?? null
+  };
+}
+
 function mapMessage(row: any): Message {
   return {
     id: row.id,
@@ -725,6 +842,25 @@ function mapInvocation(row: any): Invocation {
     startedAt: row.started_at,
     endedAt: row.ended_at,
     summary: row.summary,
-    suggestedNextRecipientId: row.suggested_next_recipient_id
+    suggestedNextRecipientId: row.suggested_next_recipient_id,
+    nativeSessionId: row.native_session_id ?? null,
+    nativeTitle: row.native_title ?? null,
+    contextMode: row.context_mode ?? undefined
   };
+}
+
+function isNativeContextAdapter(adapterType: AdapterType) {
+  return adapterType === "opencode_cli" || adapterType === "claude_cli";
+}
+
+function nativeTitle(session: Session, participant: SessionParticipant) {
+  return `loopy-${shortId(session.id)}-${shortId(participant.id)}`;
+}
+
+function shortId(id: string) {
+  return id.replace(/[^a-zA-Z0-9]/g, "").slice(-8);
+}
+
+function cryptoRandomUuid() {
+  return randomUUID();
 }

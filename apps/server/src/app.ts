@@ -6,6 +6,7 @@ import {
   DEFAULT_OPENCODE_MODEL,
   DEFAULT_CLAUDE_MODEL,
   type AgentProfile,
+  type AgentRuntimeSession,
   type AgentProfileInput,
   type ApiError,
   type CreateSessionInput,
@@ -22,15 +23,19 @@ import {
   createInvocation,
   createSession,
   deleteSession,
+  ensureRuntimeSession,
   getAgentProfile,
   getInvocation,
   getParticipant,
+  getRuntimeSessionForParticipant,
   getSessionDetail,
   hasRunningInvocation,
   listAgentProfiles,
   listSessions,
   openDb,
   recordInvocationOutcome,
+  markRuntimeSessionUsed,
+  resetRuntimeSessionForParticipant,
   saveAgentProfile,
   deleteAgentProfile,
   updateAgentProfile,
@@ -115,6 +120,32 @@ export function createApp(config: ServerConfig): FastifyInstance {
     if (!session) return reply.code(404).send({ error: "Session not found." });
     return session;
   });
+
+  app.post<{ Params: { sessionId: string; participantId: string } }>(
+    "/api/sessions/:sessionId/participants/:participantId/context/reset",
+    async (request, reply) => {
+      const session = getSessionDetail(db, request.params.sessionId);
+      if (!session) return reply.code(404).send({ error: "Session not found." });
+      const participant = getParticipant(db, request.params.participantId);
+      if (!participant || participant.sessionId !== session.id) {
+        return reply.code(404).send({ error: "Participant not found." });
+      }
+      const existing = getRuntimeSessionForParticipant(db, session.id, participant.id);
+      if (!existing) return reply.code(409).send({ error: "This participant does not use native CLI context." });
+      resetRuntimeSessionForParticipant(db, session.id, participant.id);
+      addMessage(db, {
+        sessionId: session.id,
+        fromType: "system",
+        fromId: null,
+        toType: "user",
+        toId: null,
+        messageType: "system_event",
+        content: `Native CLI context reset for ${participant.displayName}. The next run will start a new CLI session.`,
+        relatedInvocationId: null
+      });
+      return getSessionDetail(db, session.id);
+    }
+  );
 
   app.post<{ Params: { id: string }; Body: InvokeSessionInput }>("/api/sessions/:id/invoke", async (request, reply) => {
     const result = await invokeForSession(config, request.params.id, request.body);
@@ -271,7 +302,7 @@ export function createApp(config: ServerConfig): FastifyInstance {
     if (["paused", "completed", "cancelled", "timeout"].includes(session.status)) {
       return { code: 409, error: `Session is ${session.status}. Resume or create a new session before invoking.` };
     }
-    if (session.roundCount >= session.maxRounds) {
+    if (session.maxRounds > 0 && session.roundCount >= session.maxRounds) {
       updateSessionStatus(db, session.id, "completed", "Maximum rounds reached.");
       return { code: 409, error: "Maximum rounds reached." };
     }
@@ -313,6 +344,7 @@ export function createApp(config: ServerConfig): FastifyInstance {
     const paths = invocationArtifacts(serverConfig.dataDir, session.id, invocationId);
     ensureArtifactDir(paths);
     const freshSession = getSessionDetail(db, session.id)!;
+    const runtimeSession = ensureRuntimeSession(db, freshSession, participant);
     const prompt = buildPrompt(participant.agentProfile, freshSession, body.content);
     writeText(paths.promptPath, prompt);
 
@@ -320,7 +352,8 @@ export function createApp(config: ServerConfig): FastifyInstance {
       profile: participant.agentProfile,
       session: freshSession,
       prompt,
-      promptPath: paths.promptPath
+      promptPath: paths.promptPath,
+      runtimeSession
     });
 	    createInvocation(db, {
 	      id: invocationId,
@@ -337,7 +370,10 @@ export function createApp(config: ServerConfig): FastifyInstance {
       startedAt: new Date().toISOString(),
       endedAt: null,
       summary: "Invocation running...",
-      suggestedNextRecipientId: null
+      suggestedNextRecipientId: null,
+      nativeSessionId: runtimeSession?.nativeSessionId ?? null,
+      nativeTitle: runtimeSession?.nativeTitle ?? null,
+      contextMode: runtimeSession?.contextMode
     });
 
     const controller = new AbortController();
@@ -352,7 +388,9 @@ export function createApp(config: ServerConfig): FastifyInstance {
       prompt,
       promptPath: paths.promptPath,
       paths,
-      controller
+      controller,
+      shouldPostResultToUser: !body.fromParticipantId,
+      runtimeSession
     });
     return { session: getSessionDetail(db, session.id) };
   }
@@ -400,6 +438,8 @@ export function createApp(config: ServerConfig): FastifyInstance {
     promptPath: string;
     paths: ReturnType<typeof invocationArtifacts>;
     controller: AbortController;
+    shouldPostResultToUser: boolean;
+    runtimeSession: AgentRuntimeSession | null;
   }) {
     try {
       const result = await invokeAgent({
@@ -407,9 +447,15 @@ export function createApp(config: ServerConfig): FastifyInstance {
         session: input.session,
         prompt: input.prompt,
         promptPath: input.promptPath,
+        runtimeSession: input.runtimeSession,
         signal: input.controller.signal,
         onOutput: (chunk) => fs.appendFileSync(input.paths.stdoutPath, chunk, "utf8")
       });
+      const runtimePatch = updateRuntimeAfterResult(input.runtimeSession, result.nativeSessionId, result.status);
+      const nextRuntimeSession =
+        input.runtimeSession && runtimePatch
+          ? markRuntimeSessionUsed(db, input.runtimeSession, runtimePatch)
+          : input.runtimeSession;
       writeText(input.paths.stdoutPath, result.stdout);
       writeText(input.paths.stderrPath, result.stderr);
       const resultBody = result.stdout.trim() || result.stderr.trim() || (result.status === "cancelled" ? "(Stopped by user)" : "(No output)");
@@ -432,19 +478,24 @@ export function createApp(config: ServerConfig): FastifyInstance {
         endedAt: result.endedAt,
         summary,
         suggestedNextRecipientId: null,
+        nativeSessionId: nextRuntimeSession?.nativeSessionId ?? result.nativeSessionId ?? input.runtimeSession?.nativeSessionId ?? null,
+        nativeTitle: nextRuntimeSession?.nativeTitle ?? input.runtimeSession?.nativeTitle ?? null,
+        contextMode: nextRuntimeSession?.contextMode ?? input.runtimeSession?.contextMode,
         agentProfile: input.profile
       });
 
-      addMessage(db, {
-        sessionId: input.sessionId,
-        fromType: "agent",
-        fromId: input.participantId,
-        toType: "user",
-        toId: null,
-        messageType: "agent_to_user",
-        content: resultBody,
-        relatedInvocationId: input.invocationId
-      });
+      if (input.shouldPostResultToUser) {
+        addMessage(db, {
+          sessionId: input.sessionId,
+          fromType: "agent",
+          fromId: input.participantId,
+          toType: "user",
+          toId: null,
+          messageType: "agent_to_user",
+          content: resultBody,
+          relatedInvocationId: input.invocationId
+        });
+      }
 
       recordInvocationOutcome(db, input.sessionId, result.status);
       void maybeAdvanceRelay(input.sessionId, input.invocationId, result.status);
@@ -468,6 +519,9 @@ export function createApp(config: ServerConfig): FastifyInstance {
         endedAt: new Date().toISOString(),
         summary: message,
         suggestedNextRecipientId: null,
+        nativeSessionId: input.runtimeSession?.nativeSessionId ?? null,
+        nativeTitle: input.runtimeSession?.nativeTitle ?? null,
+        contextMode: input.runtimeSession?.contextMode,
         agentProfile: input.profile
       });
       recordInvocationOutcome(db, input.sessionId, "failed");
@@ -570,6 +624,20 @@ function normalizeAgentProfileInput(input: Partial<AgentProfileInput>): AgentPro
     timeoutMs: Number(input.timeoutMs ?? DEFAULT_INVOCATION_TIMEOUT_MS),
     remote: input.remote ?? null
   };
+}
+
+function updateRuntimeAfterResult(
+  runtimeSession: AgentRuntimeSession | null,
+  nativeSessionId: string | null | undefined,
+  status: string
+): { nativeSessionId?: string | null; status?: AgentRuntimeSession["status"] } | null {
+  if (!runtimeSession || runtimeSession.contextMode !== "native_cli") return null;
+  const nextNativeId = nativeSessionId ?? runtimeSession.nativeSessionId;
+  if (nextNativeId) return { nativeSessionId: nextNativeId, status: "active" };
+  if (status === "succeeded" && runtimeSession.adapterType === "opencode_cli") {
+    return { nativeSessionId: null, status: "missing" };
+  }
+  return { nativeSessionId: null, status: runtimeSession.status };
 }
 
 function createRelayState(current: RelayState | null | undefined, patch: Partial<RelayState>): RelayState {

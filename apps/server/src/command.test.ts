@@ -61,6 +61,101 @@ describe("renderCommand", () => {
     expect(rendered.args.slice(0, 4)).toEqual(["run", "--agent", "plan", "--dangerously-skip-permissions"]);
   });
 
+  it("adds opencode native title before a native session id exists", () => {
+    const rendered = renderCommand({
+      profile,
+      session,
+      prompt: "hello",
+      promptPath: "/tmp/prompt.md",
+      runtimeSession: {
+        id: "runtime_test",
+        sessionId: session.id,
+        participantId: "participant_test",
+        adapterType: "opencode_cli",
+        nativeSessionId: null,
+        nativeTitle: "loopy-test",
+        contextMode: "native_cli",
+        status: "pending",
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        lastUsedAt: null
+      }
+    });
+    expect(rendered.args.slice(0, 3)).toEqual(["run", "--title", "loopy-test"]);
+  });
+
+  it("adds opencode native session id when available", () => {
+    const rendered = renderCommand({
+      profile,
+      session,
+      prompt: "hello",
+      promptPath: "/tmp/prompt.md",
+      runtimeSession: {
+        id: "runtime_test",
+        sessionId: session.id,
+        participantId: "participant_test",
+        adapterType: "opencode_cli",
+        nativeSessionId: "ses_123",
+        nativeTitle: "loopy-test",
+        contextMode: "native_cli",
+        status: "active",
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        lastUsedAt: session.updatedAt
+      }
+    });
+    expect(rendered.args.slice(0, 3)).toEqual(["run", "--session", "ses_123"]);
+  });
+
+  it("adds claude native session id for a new runtime session", () => {
+    const rendered = renderCommand({
+      profile: { ...profile, adapterType: "claude_cli", command: "claude", args: ["-p", "{prompt}", "--output-format", "text"], model: "sonnet" },
+      session,
+      prompt: "hello",
+      promptPath: "/tmp/prompt.md",
+      runtimeSession: {
+        id: "runtime_claude",
+        sessionId: session.id,
+        participantId: "participant_test",
+        adapterType: "claude_cli",
+        nativeSessionId: "123e4567-e89b-12d3-a456-426614174000",
+        nativeTitle: "loopy-test",
+        contextMode: "native_cli",
+        status: "pending",
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        lastUsedAt: null
+      }
+    });
+    expect(rendered.args).toContain("--session-id");
+    expect(rendered.args).toContain("123e4567-e89b-12d3-a456-426614174000");
+  });
+
+  it("resumes an active claude native session", () => {
+    const rendered = renderCommand({
+      profile: { ...profile, adapterType: "claude_cli", command: "claude", args: ["-p", "{prompt}", "--output-format", "text"], model: "sonnet" },
+      session,
+      prompt: "hello again",
+      promptPath: "/tmp/prompt.md",
+      runtimeSession: {
+        id: "runtime_claude",
+        sessionId: session.id,
+        participantId: "participant_test",
+        adapterType: "claude_cli",
+        nativeSessionId: "123e4567-e89b-12d3-a456-426614174000",
+        nativeTitle: "loopy-test",
+        contextMode: "native_cli",
+        status: "active",
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        lastUsedAt: session.updatedAt
+      }
+    });
+    expect(rendered.args).toContain("--resume");
+    expect(rendered.args).toContain("123e4567-e89b-12d3-a456-426614174000");
+    expect(rendered.args).not.toContain("--session-id");
+  });
+
   it("renders remote prompt file tokens with the uploaded remote path", () => {
     const rendered = renderCommand(
       {
@@ -74,11 +169,25 @@ describe("renderCommand", () => {
         },
         session,
         prompt: "hello",
-        promptPath: "/tmp/local-prompt.md"
+        promptPath: "/tmp/local-prompt.md",
+        runtimeSession: {
+          id: "runtime_remote",
+          sessionId: session.id,
+          participantId: "participant_test",
+          adapterType: "claude_cli",
+          nativeSessionId: "123e4567-e89b-12d3-a456-426614174001",
+          nativeTitle: "loopy-remote",
+          contextMode: "native_cli",
+          status: "active",
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+          lastUsedAt: session.updatedAt
+        }
       },
       { remotePromptFile: "/tmp/loopy-prompts/remote-prompt.md" }
     );
     expect(rendered.args).toContain("/tmp/loopy-prompts/remote-prompt.md");
+    expect(rendered.args).toContain("--resume");
     expect(rendered.args).not.toContain("/tmp/local-prompt.md");
     expect(rendered.cwd).toBe("/srv/loopy");
   });
